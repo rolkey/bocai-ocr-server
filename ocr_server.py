@@ -1,7 +1,7 @@
 from flask import Flask, request, jsonify
 from paddleocr import PaddleOCR
 import tempfile, os
-from PIL import Image, ImageEnhance
+from PIL import Image, ImageFilter
 
 app = Flask(__name__)
 ocr = None
@@ -14,20 +14,21 @@ def do_ocr():
             ocr = PaddleOCR(
                 lang="ch",
                 use_angle_cls=False,
-                det_db_thresh=0.2,
-                det_db_box_thresh=0.4,
-                det_db_unclip_ratio=1.8,
+                det_db_thresh=0.15,
+                det_db_box_thresh=0.35,
+                det_db_unclip_ratio=2.5,
             )
             print("PaddleOCR initialized")
         file = request.files.get("image")
         if not file: return jsonify({"error": "no image"}), 400
         tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
         file.save(tmp.name); tmp.close()
-        try:
-            Image.open(tmp.name).verify()
-        except:
-            os.unlink(tmp.name)
-            return jsonify({"error": "invalid image"}), 400
+        # 灰度 → 二值化 → 强开运算（断开框线，恢复文字）
+        img = Image.open(tmp.name).convert('L')
+        img = img.point(lambda x: 0 if x < 110 else 255)    # 二值化（更低阈值，框内文字不丢）
+        img = img.filter(ImageFilter.MinFilter(5))            # 腐蚀：去掉矩形/圆形边框
+        img = img.filter(ImageFilter.MaxFilter(4))            # 膨胀：恢复文字
+        img.save(tmp.name)
         result = ocr.ocr(tmp.name)
         lines = []
         lines_data = []
@@ -36,7 +37,7 @@ def do_ocr():
                 if item and len(item) >= 2:
                     bbox = item[0]
                     text, conf = item[1][0], item[1][1]
-                    if conf > 0.5:
+                    if conf > 0.3:
                         lines.append(text)
                         xs = [p[0] for p in bbox]
                         ys = [p[1] for p in bbox]
