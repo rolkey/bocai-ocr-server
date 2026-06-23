@@ -9,69 +9,88 @@ ocr = None
 # ── 合并同行拆分文本框 ──
 def merge_adjacent(lines_data, image_path):
     """
-    第2遍：检测同行、间距小的文本框，裁剪合并区域重OCR。
-    解决 PP-OCRv4 det 模型在低分辨率下把同行文字切成多块的问题。
+    第2遍：按行分组 → 同组相邻框合并裁剪 → 重OCR。
+    解决 PP-OCRv4 det 在低分辨率下把同行文字切成多块的问题。
     """
     if not ocr or len(lines_data) < 2:
         return lines_data
 
-    # 按 y 中心排序
-    indexed = sorted(enumerate(lines_data), key=lambda t: t[1]['cy'])
-    pairs = []
-    for i in range(len(indexed) - 1):
-        ia, a = indexed[i]
-        ib, b = indexed[i + 1]
-        # 同行：y 中心差 < 平均高度
-        same_row = abs(a['cy'] - b['cy']) < (a['h'] + b['h']) / 2
-        # 间距：水平间隔 > 0 且 < 平均宽度
-        gap = b['x'] - (a['x'] + a['w'])
-        close = 0 < gap < (a['w'] + b['w']) / 2
-        if same_row and close:
-            pairs.append((ia, ib))
+    # ── 按行分组 ──
+    items = [(i, d) for i, d in enumerate(lines_data)]
+    items.sort(key=lambda t: t[1]['cy'])
 
-    if not pairs:
-        return lines_data
+    rows = []  # [[(idx, data), ...], ...]
+    for idx, d in items:
+        placed = False
+        for row in rows:
+            rep = row[0][1]
+            if abs(d['cy'] - rep['cy']) < (d['h'] + rep['h']) * 0.4:
+                row.append((idx, d))
+                placed = True
+                break
+        if not placed:
+            rows.append([(idx, d)])
 
+    # ── 每组内：相邻、靠近/重叠的框合并 ──
     img = Image.open(image_path)
     pw, ph = img.size
     merged = list(lines_data)
     to_drop = set()
 
-    for ia, ib in pairs:
-        if ia in to_drop or ib in to_drop:
+    for row in rows:
+        if len(row) < 2:
             continue
-        a, b = lines_data[ia], lines_data[ib]
-        # 裁剪合并区域（向外扩 3px）
-        x1 = max(0, min(a['x'], b['x']) - 3)
-        y1 = max(0, min(a['y'], b['y']) - 3)
-        x2 = min(pw, max(a['x'] + a['w'], b['x'] + b['w']) + 3)
-        y2 = min(ph, max(a['y'] + a['h'], b['y'] + b['h']) + 3)
+        row.sort(key=lambda t: t[1]['x'])
+        i = 0
+        while i < len(row) - 1:
+            # 收集当前可合并的连续框
+            group = [row[i]]
+            j = i + 1
+            while j < len(row):
+                prev = group[-1][1]
+                curr = row[j][1]
+                gap = curr['x'] - (prev['x'] + prev['w'])
+                if gap < (prev['w'] + curr['w']) * 0.3:
+                    group.append(row[j])
+                    j += 1
+                else:
+                    break
+            if len(group) >= 2:
+                # 裁剪合并区域
+                min_x = min(d['x'] for _, d in group)
+                max_xe = max(d['x'] + d['w'] for _, d in group)
+                min_y = min(d['y'] for _, d in group)
+                max_ye = max(d['y'] + d['h'] for _, d in group)
+                x1, y1 = max(0, min_x - 3), max(0, min_y - 3)
+                x2, y2 = min(pw, max_xe + 3), min(ph, max_ye + 3)
 
-        crop = img.crop((x1, y1, x2, y2))
-        fd, crop_path = tempfile.mkstemp(suffix='.jpg')
-        os.close(fd)
-        crop.save(crop_path)
+                crop = img.crop((x1, y1, x2, y2))
+                fd, crop_path = tempfile.mkstemp(suffix='.jpg')
+                os.close(fd)
+                crop.save(crop_path)
 
-        r = ocr.ocr(crop_path)
-        if r and r[0]:
-            # 取置信度最高的行
-            best = max(r[0], key=lambda it: it[1][1])
-            if best[1][1] > 0.5:
-                bbox, (text, conf) = best
-                xs = [p[0] for p in bbox]
-                ys = [p[1] for p in bbox]
-                merged[ia] = {
-                    'text': text,
-                    'confidence': round(conf, 2),
-                    'x': x1 + round(min(xs)),
-                    'y': y1 + round(min(ys)),
-                    'w': round(max(xs) - min(xs)),
-                    'h': round(max(ys) - min(ys)),
-                    'cx': x1 + round(sum(xs) / 4, 1),
-                    'cy': y1 + round(sum(ys) / 4, 1),
-                }
-                to_drop.add(ib)
-        os.unlink(crop_path)
+                r = ocr.ocr(crop_path)
+                if r and r[0]:
+                    best = max(r[0], key=lambda it: it[1][1])
+                    if best[1][1] > 0.5:
+                        bbox, (text, conf) = best
+                        xs = [p[0] for p in bbox]
+                        ys = [p[1] for p in bbox]
+                        keep_idx = group[0][0]
+                        merged[keep_idx] = {
+                            'text': text,
+                            'confidence': round(conf, 2),
+                            'x': x1 + round(min(xs)),
+                            'y': y1 + round(min(ys)),
+                            'w': round(max(xs) - min(xs)),
+                            'h': round(max(ys) - min(ys)),
+                            'cx': x1 + round(sum(xs) / 4, 1),
+                            'cy': y1 + round(sum(ys) / 4, 1),
+                        }
+                        for gidx, _ in group[1:]:
+                            to_drop.add(gidx)
+                os.unlink(crop_path)
+            i = j
 
     return [item for i, item in enumerate(merged) if i not in to_drop]
 
