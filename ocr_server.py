@@ -50,7 +50,8 @@ def merge_adjacent(lines_data, image_path):
                 prev = group[-1][1]
                 curr = row[j][1]
                 gap = curr['x'] - (prev['x'] + prev['w'])
-                if gap < (prev['w'] + curr['w']) * 0.3:
+                # 只合并重叠或紧邻的框（绝对间距 < 10px）
+                if gap < 10:
                     group.append(row[j])
                     j += 1
                 else:
