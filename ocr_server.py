@@ -1,12 +1,160 @@
 from flask import Flask, request, jsonify
 from paddleocr import PaddleOCR
-import tempfile, os
+import tempfile, os, re
 from PIL import Image
 
 app = Flask(__name__)
 ocr = None
 
-# ── 合并同行拆分文本框 ──
+# ═══════════════════════════════════════════════════════════
+#  生肖知识库
+# ═══════════════════════════════════════════════════════════
+
+ZODIAC_ANIMALS = ["鼠", "牛", "虎", "兔", "龙", "蛇", "马", "羊", "猴", "鸡", "狗", "猪"]
+
+ZODIAC_NUM = {
+    "鼠": 1, "牛": 2, "虎": 3, "兔": 4, "龙": 5, "蛇": 6,
+    "马": 7, "羊": 8, "猴": 9, "鸡": 10, "狗": 11, "猪": 12,
+}
+
+ZODIAC_ALIASES = {
+    "老鼠": "鼠", "水牛": "牛", "黄牛": "牛", "老虎": "虎", "白兔": "兔",
+    "青龙": "龙", "金龙": "龙", "飞龙": "龙", "小龙": "蛇", "花蛇": "蛇",
+    "红马": "马", "黑马": "马", "白马": "马", "山羊": "羊", "绵羊": "羊",
+    "金猴": "猴", "火猴": "猴", "公鸡": "鸡", "母鸡": "鸡", "黑狗": "狗",
+    "黄狗": "狗", "白猪": "猪", "黑猪": "猪", "花猪": "猪",
+}
+
+WAVE_COLORS = {"红波": "red", "蓝波": "blue", "绿波": "green"}
+
+ELEMENTS = ["金", "木", "水", "火", "土"]
+
+LOTTERY_KEYWORDS = [
+    "特码", "正码", "平码", "头数", "尾数", "生肖", "波色", "五行",
+    "一肖", "二肖", "三肖", "四肖", "五肖", "六肖",
+    "一码", "二码", "三码", "四码", "五码", "六码",
+    "中特", "不中", "澳彩", "港彩", "六合彩",
+]
+
+# ═══════════════════════════════════════════════════════════
+#  生肖分析函数
+# ═══════════════════════════════════════════════════════════
+
+def is_zodiac_related(text):
+    """判断文本是否与生肖相关"""
+    for animal in ZODIAC_ANIMALS:
+        if animal in text:
+            return True
+    for alias in ZODIAC_ALIASES:
+        if alias in text:
+            return True
+    for wc in WAVE_COLORS:
+        if wc in text:
+            return True
+    for elem in ELEMENTS:
+        if elem in text:
+            return True
+    for kw in LOTTERY_KEYWORDS:
+        if kw in text:
+            return True
+    return False
+
+
+def extract_zodiac_animals(text):
+    """从文本中提取所有生肖动物"""
+    found = []
+    # 先检查别名（长词优先）
+    for alias, animal in ZODIAC_ALIASES.items():
+        if alias in text:
+            found.append({"alias": alias, "zodiac": animal, "num": ZODIAC_NUM[animal]})
+    # 再检查单字，避免别名已覆盖的情况
+    for ch in text:
+        if ch in ZODIAC_ANIMALS:
+            already = any(f["zodiac"] == ch for f in found)
+            is_part_of_alias = any(ch in f.get("alias", "") for f in found if f.get("alias"))
+            if not already and not is_part_of_alias:
+                found.append({"alias": None, "zodiac": ch, "num": ZODIAC_NUM[ch]})
+    return found
+
+
+def extract_numbers(text):
+    return [int(n) for n in re.findall(r'\d+', text)]
+
+
+def extract_wave_colors(text):
+    return [{"cn": wc, "en": en} for wc, en in WAVE_COLORS.items() if wc in text]
+
+
+def extract_elements(text):
+    return [e for e in ELEMENTS if e in text]
+
+
+def extract_keywords(text):
+    return [kw for kw in LOTTERY_KEYWORDS if kw in text]
+
+
+def build_zodiac_summary(lines_data):
+    """基于 OCR 行数据构建生肖分析摘要"""
+    all_zodiacs, seen_z = [], set()
+    all_colors, seen_c = [], set()
+    all_elements, seen_e = [], set()
+    all_keywords, seen_k = [], set()
+    zodiac_lines = []
+
+    for item in lines_data:
+        text = item["text"]
+        if not is_zodiac_related(text):
+            continue
+        zodiac_lines.append(item)
+
+        # 为每行追加生肖分析字段
+        item["zodiac_animals"] = extract_zodiac_animals(text)
+        item["numbers"] = extract_numbers(text)
+        item["wave_colors"] = extract_wave_colors(text)
+        item["elements"] = extract_elements(text)
+        item["keywords"] = extract_keywords(text)
+
+        for za in item["zodiac_animals"]:
+            if za["zodiac"] not in seen_z:
+                seen_z.add(za["zodiac"])
+                all_zodiacs.append(za)
+        for wc in item["wave_colors"]:
+            if wc["cn"] not in seen_c:
+                seen_c.add(wc["cn"])
+                all_colors.append(wc)
+        for e in item["elements"]:
+            if e not in seen_e:
+                seen_e.add(e)
+                all_elements.append(e)
+        for kw in item["keywords"]:
+            if kw not in seen_k:
+                seen_k.add(kw)
+                all_keywords.append(kw)
+
+    # 为不相关的行补空字段
+    for item in lines_data:
+        if "zodiac_animals" not in item:
+            item["zodiac_animals"] = []
+            item["numbers"] = []
+            item["wave_colors"] = []
+            item["elements"] = []
+            item["keywords"] = []
+
+    return {
+        "zodiacs": all_zodiacs,
+        "wave_colors": all_colors,
+        "elements": all_elements,
+        "keywords": all_keywords,
+        "zodiac_count": len(all_zodiacs),
+        "primary_zodiac": all_zodiacs[0] if all_zodiacs else None,
+        "zodiac_lines": len(zodiac_lines),
+    }
+
+
+# ═══════════════════════════════════════════════════════════
+#  合并同行拆分文本框 (原有的第2遍逻辑)
+# ═══════════════════════════════════════════════════════════
+
 def merge_adjacent(lines_data, image_path):
     """
     第2遍：按行分组 → 同组相邻框合并裁剪 → 重OCR。
@@ -43,21 +191,18 @@ def merge_adjacent(lines_data, image_path):
         row.sort(key=lambda t: t[1]['x'])
         i = 0
         while i < len(row) - 1:
-            # 收集当前可合并的连续框
             group = [row[i]]
             j = i + 1
             while j < len(row):
                 prev = group[-1][1]
                 curr = row[j][1]
                 gap = curr['x'] - (prev['x'] + prev['w'])
-                # 只合并重叠或紧邻的框（绝对间距 < 10px）
                 if gap < 10:
                     group.append(row[j])
                     j += 1
                 else:
                     break
             if len(group) >= 2:
-                # 裁剪合并区域
                 min_x = min(d['x'] for _, d in group)
                 max_xe = max(d['x'] + d['w'] for _, d in group)
                 min_y = min(d['y'] for _, d in group)
@@ -96,6 +241,33 @@ def merge_adjacent(lines_data, image_path):
     return [item for i, item in enumerate(merged) if i not in to_drop]
 
 
+# ═══════════════════════════════════════════════════════════
+#  API 路由
+# ═══════════════════════════════════════════════════════════
+
+@app.route("/")
+def index():
+    return jsonify({
+        "service": "生肖文字 OCR 识别服务",
+        "version": "2.0.0",
+        "engine": "PaddleOCR PP-OCRv4 mobile",
+        "endpoints": {
+            "POST /ocr": "上传图片 OCR 识别（含生肖分析）",
+            "POST /ocr/extract": "精简模式（仅生肖摘要）",
+            "GET /health": "健康检查",
+        },
+    })
+
+
+@app.route("/health")
+def health():
+    global ocr
+    return jsonify({
+        "status": "ok",
+        "ocr_ready": ocr is not None,
+    })
+
+
 @app.route("/ocr", methods=["POST"])
 def do_ocr():
     global ocr
@@ -108,7 +280,7 @@ def do_ocr():
                 det_db_box_thresh=0.5,
                 det_db_unclip_ratio=1.8,
             )
-            print("PaddleOCR initialized (PP-OCRv4 mobile, tuned + merge)")
+            print("PaddleOCR initialized (PP-OCRv4 mobile, tuned + merge + zodiac)")
 
         file = request.files.get("image")
         if not file:
@@ -148,17 +320,84 @@ def do_ocr():
 
         # ── 第2遍：合并同行拆分框 ──
         lines_data = merge_adjacent(lines_data, tmp.name)
-
         os.unlink(tmp.name)
 
-        lines = [item["text"] for item in lines_data]
+        # ── 生肖分析 ──
+        summary = build_zodiac_summary(lines_data)
+        lines_text = [item["text"] for item in lines_data]
+
         return jsonify({
-            "text": "\n".join(lines),
-            "lines": len(lines),
+            "text": "\n".join(lines_text),
+            "lines": len(lines_text),
             "lines_data": lines_data,
+            "summary": summary,
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+@app.route("/ocr/extract", methods=["POST"])
+def do_ocr_extract():
+    """精简模式：仅返回生肖摘要 + 全文"""
+    global ocr
+    try:
+        if ocr is None:
+            ocr = PaddleOCR(
+                lang="ch",
+                use_angle_cls=True,
+                det_db_thresh=0.2,
+                det_db_box_thresh=0.5,
+                det_db_unclip_ratio=1.8,
+            )
+
+        file = request.files.get("image")
+        if not file:
+            return jsonify({"error": "no image"}), 400
+
+        tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
+        file.save(tmp.name)
+        tmp.close()
+
+        try:
+            Image.open(tmp.name).verify()
+        except Exception:
+            os.unlink(tmp.name)
+            return jsonify({"error": "invalid image"}), 400
+
+        result = ocr.ocr(tmp.name)
+        lines_data = []
+        if result and result[0]:
+            for item in result[0]:
+                if item and len(item) >= 2:
+                    bbox = item[0]
+                    text, conf = item[1][0], item[1][1]
+                    if conf > 0.5:
+                        xs = [p[0] for p in bbox]
+                        ys = [p[1] for p in bbox]
+                        lines_data.append({
+                            "text": text,
+                            "confidence": round(conf, 2),
+                            "x": round(min(xs)),
+                            "y": round(min(ys)),
+                            "w": round(max(xs) - min(xs)),
+                            "h": round(max(ys) - min(ys)),
+                            "cx": round(sum(xs) / 4, 1),
+                            "cy": round(sum(ys) / 4, 1),
+                        })
+
+        lines_data = merge_adjacent(lines_data, tmp.name)
+        os.unlink(tmp.name)
+
+        summary = build_zodiac_summary(lines_data)
+        all_text = "".join(item["text"] for item in lines_data)
+
+        return jsonify({
+            "all_text": all_text,
+            "summary": summary,
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8899)
