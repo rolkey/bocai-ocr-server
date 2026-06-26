@@ -12,6 +12,19 @@ ocr = None
 
 ZODIAC_ANIMALS = ["鼠", "牛", "虎", "兔", "龙", "蛇", "马", "羊", "猴", "鸡", "狗", "猪"]
 
+# OCR 易混字符修正：上下文含生肖时，"免" → "兔"（"免"非生肖字）
+OCR_CORRECTIONS = {"免": "兔"}
+
+
+def _correct_zodiac_text(text: str) -> str:
+    has_zodiac = any(z in text for z in ZODIAC_ANIMALS)
+    if not has_zodiac:
+        return text
+    for wrong, right in OCR_CORRECTIONS.items():
+        if wrong in text:
+            text = text.replace(wrong, right)
+    return text
+
 ZODIAC_NUM = {
     "鼠": 1, "牛": 2, "虎": 3, "兔": 4, "龙": 5, "蛇": 6,
     "马": 7, "羊": 8, "猴": 9, "鸡": 10, "狗": 11, "猪": 12,
@@ -325,6 +338,8 @@ def do_ocr():
         # ── 生肖分析 ──
         summary = build_zodiac_summary(lines_data)
         lines_text = [item["text"] for item in lines_data]
+        # 后处理：生肖行中修正 OCR 易混字符
+        lines_text = [_correct_zodiac_text(t) for t in lines_text]
 
         return jsonify({
             "text": "\n".join(lines_text),
@@ -387,6 +402,9 @@ def do_ocr_extract():
 
         lines_data = merge_adjacent(lines_data, tmp.name)
         os.unlink(tmp.name)
+
+        for item in lines_data:
+            item["text"] = _correct_zodiac_text(item["text"])
 
         summary = build_zodiac_summary(lines_data)
         all_text = "".join(item["text"] for item in lines_data)
