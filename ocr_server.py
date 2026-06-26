@@ -336,10 +336,10 @@ def do_ocr():
         os.unlink(tmp.name)
 
         # ── 生肖分析 ──
+        for item in lines_data:
+            item["text"] = _correct_zodiac_text(item["text"])
         summary = build_zodiac_summary(lines_data)
         lines_text = [item["text"] for item in lines_data]
-        # 后处理：生肖行中修正 OCR 易混字符
-        lines_text = [_correct_zodiac_text(t) for t in lines_text]
 
         return jsonify({
             "text": "\n".join(lines_text),
