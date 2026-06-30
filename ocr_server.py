@@ -1,10 +1,11 @@
 from flask import Flask, request, jsonify
 from paddleocr import PaddleOCR
-import tempfile, os, re
+import tempfile, os, re, threading
 from PIL import Image
 
 app = Flask(__name__)
 ocr = None
+ocr_lock = threading.Lock()  # PaddleOCR 不支持并发，串行处理
 
 # ═══════════════════════════════════════════════════════════
 #  生肖知识库
@@ -284,137 +285,139 @@ def health():
 @app.route("/ocr", methods=["POST"])
 def do_ocr():
     global ocr
-    try:
-        if ocr is None:
-            ocr = PaddleOCR(
-                lang="ch",
-                use_angle_cls=True,
-                det_db_thresh=0.2,
-                det_db_box_thresh=0.5,
-                det_db_unclip_ratio=1.8,
-            )
-            print("PaddleOCR initialized (PP-OCRv4 mobile, tuned + merge + zodiac)")
-
-        file = request.files.get("image")
-        if not file:
-            return jsonify({"error": "no image"}), 400
-
-        tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
-        file.save(tmp.name)
-        tmp.close()
-
+    with ocr_lock:
         try:
-            Image.open(tmp.name).verify()
-        except Exception:
+            if ocr is None:
+                ocr = PaddleOCR(
+                    lang="ch",
+                    use_angle_cls=True,
+                    det_db_thresh=0.2,
+                    det_db_box_thresh=0.5,
+                    det_db_unclip_ratio=1.8,
+                )
+                print("PaddleOCR initialized (PP-OCRv4 mobile, tuned + merge + zodiac)")
+
+            file = request.files.get("image")
+            if not file:
+                return jsonify({"error": "no image"}), 400
+
+            tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
+            file.save(tmp.name)
+            tmp.close()
+
+            try:
+                Image.open(tmp.name).verify()
+            except Exception:
+                os.unlink(tmp.name)
+                return jsonify({"error": "invalid image"}), 400
+
+            # ── 第1遍：全图 OCR ──
+            result = ocr.ocr(tmp.name)
+            lines_data = []
+            if result and result[0]:
+                for item in result[0]:
+                    if item and len(item) >= 2:
+                        bbox = item[0]
+                        text, conf = item[1][0], item[1][1]
+                        if conf > 0.5:
+                            xs = [p[0] for p in bbox]
+                            ys = [p[1] for p in bbox]
+                            lines_data.append({
+                                "text": text,
+                                "confidence": round(conf, 2),
+                                "x": round(min(xs)),
+                                "y": round(min(ys)),
+                                "w": round(max(xs) - min(xs)),
+                                "h": round(max(ys) - min(ys)),
+                                "cx": round(sum(xs) / 4, 1),
+                                "cy": round(sum(ys) / 4, 1),
+                            })
+
+            # ── 第2遍：合并同行拆分框 ──
+            lines_data = merge_adjacent(lines_data, tmp.name)
             os.unlink(tmp.name)
-            return jsonify({"error": "invalid image"}), 400
 
-        # ── 第1遍：全图 OCR ──
-        result = ocr.ocr(tmp.name)
-        lines_data = []
-        if result and result[0]:
-            for item in result[0]:
-                if item and len(item) >= 2:
-                    bbox = item[0]
-                    text, conf = item[1][0], item[1][1]
-                    if conf > 0.5:
-                        xs = [p[0] for p in bbox]
-                        ys = [p[1] for p in bbox]
-                        lines_data.append({
-                            "text": text,
-                            "confidence": round(conf, 2),
-                            "x": round(min(xs)),
-                            "y": round(min(ys)),
-                            "w": round(max(xs) - min(xs)),
-                            "h": round(max(ys) - min(ys)),
-                            "cx": round(sum(xs) / 4, 1),
-                            "cy": round(sum(ys) / 4, 1),
-                        })
+            # ── 生肖分析 ──
+            for item in lines_data:
+                item["text"] = _correct_zodiac_text(item["text"])
+            summary = build_zodiac_summary(lines_data)
+            lines_text = [item["text"] for item in lines_data]
 
-        # ── 第2遍：合并同行拆分框 ──
-        lines_data = merge_adjacent(lines_data, tmp.name)
-        os.unlink(tmp.name)
-
-        # ── 生肖分析 ──
-        for item in lines_data:
-            item["text"] = _correct_zodiac_text(item["text"])
-        summary = build_zodiac_summary(lines_data)
-        lines_text = [item["text"] for item in lines_data]
-
-        return jsonify({
-            "text": "\n".join(lines_text),
-            "lines": len(lines_text),
-            "lines_data": lines_data,
-            "summary": summary,
-        })
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+            return jsonify({
+                "text": "\n".join(lines_text),
+                "lines": len(lines_text),
+                "lines_data": lines_data,
+                "summary": summary,
+            })
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
 
 
 @app.route("/ocr/extract", methods=["POST"])
 def do_ocr_extract():
     """精简模式：仅返回生肖摘要 + 全文"""
     global ocr
-    try:
-        if ocr is None:
-            ocr = PaddleOCR(
-                lang="ch",
-                use_angle_cls=True,
-                det_db_thresh=0.2,
-                det_db_box_thresh=0.5,
-                det_db_unclip_ratio=1.8,
-            )
-
-        file = request.files.get("image")
-        if not file:
-            return jsonify({"error": "no image"}), 400
-
-        tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
-        file.save(tmp.name)
-        tmp.close()
-
+    with ocr_lock:
         try:
-            Image.open(tmp.name).verify()
-        except Exception:
+            if ocr is None:
+                ocr = PaddleOCR(
+                    lang="ch",
+                    use_angle_cls=True,
+                    det_db_thresh=0.2,
+                    det_db_box_thresh=0.5,
+                    det_db_unclip_ratio=1.8,
+                )
+
+            file = request.files.get("image")
+            if not file:
+                return jsonify({"error": "no image"}), 400
+
+            tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
+            file.save(tmp.name)
+            tmp.close()
+
+            try:
+                Image.open(tmp.name).verify()
+            except Exception:
+                os.unlink(tmp.name)
+                return jsonify({"error": "invalid image"}), 400
+
+            result = ocr.ocr(tmp.name)
+            lines_data = []
+            if result and result[0]:
+                for item in result[0]:
+                    if item and len(item) >= 2:
+                        bbox = item[0]
+                        text, conf = item[1][0], item[1][1]
+                        if conf > 0.5:
+                            xs = [p[0] for p in bbox]
+                            ys = [p[1] for p in bbox]
+                            lines_data.append({
+                                "text": text,
+                                "confidence": round(conf, 2),
+                                "x": round(min(xs)),
+                                "y": round(min(ys)),
+                                "w": round(max(xs) - min(xs)),
+                                "h": round(max(ys) - min(ys)),
+                                "cx": round(sum(xs) / 4, 1),
+                                "cy": round(sum(ys) / 4, 1),
+                            })
+
+            lines_data = merge_adjacent(lines_data, tmp.name)
             os.unlink(tmp.name)
-            return jsonify({"error": "invalid image"}), 400
 
-        result = ocr.ocr(tmp.name)
-        lines_data = []
-        if result and result[0]:
-            for item in result[0]:
-                if item and len(item) >= 2:
-                    bbox = item[0]
-                    text, conf = item[1][0], item[1][1]
-                    if conf > 0.5:
-                        xs = [p[0] for p in bbox]
-                        ys = [p[1] for p in bbox]
-                        lines_data.append({
-                            "text": text,
-                            "confidence": round(conf, 2),
-                            "x": round(min(xs)),
-                            "y": round(min(ys)),
-                            "w": round(max(xs) - min(xs)),
-                            "h": round(max(ys) - min(ys)),
-                            "cx": round(sum(xs) / 4, 1),
-                            "cy": round(sum(ys) / 4, 1),
-                        })
+            for item in lines_data:
+                item["text"] = _correct_zodiac_text(item["text"])
 
-        lines_data = merge_adjacent(lines_data, tmp.name)
-        os.unlink(tmp.name)
+            summary = build_zodiac_summary(lines_data)
+            all_text = "".join(item["text"] for item in lines_data)
 
-        for item in lines_data:
-            item["text"] = _correct_zodiac_text(item["text"])
-
-        summary = build_zodiac_summary(lines_data)
-        all_text = "".join(item["text"] for item in lines_data)
-
-        return jsonify({
-            "all_text": all_text,
-            "summary": summary,
-        })
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+            return jsonify({
+                "all_text": all_text,
+                "summary": summary,
+            })
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
 
 
 if __name__ == "__main__":
