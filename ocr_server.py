@@ -14,7 +14,7 @@ ocr_lock = threading.Lock()
 #  生肖知识库
 # ═══════════════════════════════════════════════════════════
 
-ZODIAC_ANIMALS = ["鼠", "牛", "虎", "兔", "龙", "蛇", "马", "羊", "猴", "鸡", "狗", "猪"]
+ZODIAC_ANIMALS = ["鼠", "牛", "虎", "兔", "龍", "龙", "蛇", "馬", "马", "羊", "猴", "雞", "鸡", "狗", "豬", "猪"]
 
 # OCR 易混字符修正：上下文含生肖时，"免" → "兔"（"免"非生肖字）
 OCR_CORRECTIONS = {"免": "兔"}
@@ -27,12 +27,18 @@ def _correct_zodiac_text(text: str) -> str:
     for wrong, right in OCR_CORRECTIONS.items():
         if wrong in text:
             text = text.replace(wrong, right)
+    for trad, simp in ZODIAC_T2S.items():
+        text = text.replace(trad, simp)
     return text
 
 ZODIAC_NUM = {
-    "鼠": 1, "牛": 2, "虎": 3, "兔": 4, "龙": 5, "蛇": 6,
-    "马": 7, "羊": 8, "猴": 9, "鸡": 10, "狗": 11, "猪": 12,
+    "鼠": 1, "牛": 2, "虎": 3, "兔": 4, "龍": 5, "龙": 5,
+    "蛇": 6, "馬": 7, "马": 7, "羊": 8, "猴": 9,
+    "雞": 10, "鸡": 10, "狗": 11, "豬": 12, "猪": 12,
 }
+
+# 繁体→简体 生肖映射（OCR 输出统一为简体）
+ZODIAC_T2S = {"龍": "龙", "馬": "马", "雞": "鸡", "豬": "猪", "兎": "兔"}
 
 ZODIAC_ALIASES = {
     "老鼠": "鼠", "水牛": "牛", "黄牛": "牛", "老虎": "虎", "白兔": "兔",
