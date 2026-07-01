@@ -34,11 +34,12 @@ OCR_CORRECTIONS = {
 
 def _correct_zodiac_text(text: str) -> str:
     has_zodiac = any(z in text for z in ZODIAC_ANIMALS)
-    if not has_zodiac:
-        return text
+    # OCR 易混字修正始终执行（如 免→兔，即使行内无生肖字）
     for wrong, right in OCR_CORRECTIONS.items():
         if wrong in text:
             text = text.replace(wrong, right)
+    if not has_zodiac:
+        return text
     for trad, simp in ZODIAC_T2S.items():
         text = text.replace(trad, simp)
     return text
