@@ -1,11 +1,14 @@
+#!/usr/bin/env python3
+# OCR 服务 — PaddleX PP-OCRv6 管线
+# 运行: /root/ocr-paddlex-venv/bin/python3 ocr_server.py
 from flask import Flask, request, jsonify
-from paddleocr import PaddleOCR
+from paddlex import create_pipeline
 import tempfile, os, re, threading
 from PIL import Image
 
 app = Flask(__name__)
-ocr = None
-ocr_lock = threading.Lock()  # PaddleOCR 不支持并发，串行处理
+pipeline = None
+ocr_lock = threading.Lock()
 
 # ═══════════════════════════════════════════════════════════
 #  生肖知识库
@@ -263,8 +266,8 @@ def merge_adjacent(lines_data, image_path):
 def index():
     return jsonify({
         "service": "生肖文字 OCR 识别服务",
-        "version": "2.0.0",
-        "engine": "PaddleOCR PP-OCRv4 mobile",
+        "version": "3.0.0",
+        "engine": "PaddleX PP-OCRv6 medium",
         "endpoints": {
             "POST /ocr": "上传图片 OCR 识别（含生肖分析）",
             "POST /ocr/extract": "精简模式（仅生肖摘要）",
@@ -275,27 +278,70 @@ def index():
 
 @app.route("/health")
 def health():
-    global ocr
+    global pipeline
     return jsonify({
         "status": "ok",
-        "ocr_ready": ocr is not None,
+        "pipeline_ready": pipeline is not None,
     })
+
+
+def _paddlex_to_lines(ocr_result) -> list[dict]:
+    """Convert PaddleX OCRResult to legacy lines_data format."""
+    j = ocr_result.json
+    res = j.get("res", {})
+    texts = res.get("rec_texts", [])
+    scores = res.get("rec_scores", [])
+    polys = res.get("rec_polys", [])
+
+    lines = []
+    for text, score, poly in zip(texts, scores, polys):
+        if score < 0.5:
+            continue
+        if poly and len(poly) >= 4:
+            xs = [p[0] for p in poly]
+            ys = [p[1] for p in poly]
+            lines.append({
+                "text": text,
+                "confidence": round(score, 2),
+                "x": round(min(xs)),
+                "y": round(min(ys)),
+                "w": round(max(xs) - min(xs)),
+                "h": round(max(ys) - min(ys)),
+                "cx": round(sum(xs) / 4, 1),
+                "cy": round(sum(ys) / 4, 1),
+            })
+    return lines
 
 
 @app.route("/ocr", methods=["POST"])
 def do_ocr():
-    global ocr
+    global pipeline
     with ocr_lock:
         try:
-            if ocr is None:
-                ocr = PaddleOCR(
-                    lang="ch",
-                    use_angle_cls=True,
-                    det_db_thresh=0.2,
-                    det_db_box_thresh=0.5,
-                    det_db_unclip_ratio=1.8,
-                )
-                print("PaddleOCR initialized (PP-OCRv4 mobile, tuned + merge + zodiac)")
+            if pipeline is None:
+                pipeline = create_pipeline(config={
+                    "pipeline_name": "OCR",
+                    "text_type": "general",
+                    "use_doc_preprocessor": False,
+                    "use_textline_orientation": False,
+                    "SubModules": {
+                        "TextDetection": {
+                            "model_name": "PP-OCRv6_medium_det",
+                            "limit_side_len": 64,
+                            "limit_type": "min",
+                            "thresh": 0.3,
+                            "box_thresh": 0.6,
+                            "unclip_ratio": 1.5,
+                        },
+                        "TextRecognition": {
+                            "model_name": "PP-OCRv6_medium_rec",
+                            "score_thresh": 0.0,
+                            "return_word_box": False,
+                        },
+                    },
+                    "SubPipelines": {},
+                })
+                print("PaddleX OCR pipeline initialized (PP-OCRv6 medium, doc_preprocessor=off)")
 
             file = request.files.get("image")
             if not file:
@@ -311,33 +357,13 @@ def do_ocr():
                 os.unlink(tmp.name)
                 return jsonify({"error": "invalid image"}), 400
 
-            # ── 第1遍：全图 OCR ──
-            result = ocr.ocr(tmp.name)
+            # PaddleX OCR 管线（含文档方向矫正 + 去扭曲 + 文字行方向矫正）
             lines_data = []
-            if result and result[0]:
-                for item in result[0]:
-                    if item and len(item) >= 2:
-                        bbox = item[0]
-                        text, conf = item[1][0], item[1][1]
-                        if conf > 0.5:
-                            xs = [p[0] for p in bbox]
-                            ys = [p[1] for p in bbox]
-                            lines_data.append({
-                                "text": text,
-                                "confidence": round(conf, 2),
-                                "x": round(min(xs)),
-                                "y": round(min(ys)),
-                                "w": round(max(xs) - min(xs)),
-                                "h": round(max(ys) - min(ys)),
-                                "cx": round(sum(xs) / 4, 1),
-                                "cy": round(sum(ys) / 4, 1),
-                            })
-
-            # ── 第2遍：合并同行拆分框 ──
-            lines_data = merge_adjacent(lines_data, tmp.name)
+            for result in pipeline.predict(tmp.name):
+                lines_data = _paddlex_to_lines(result)
             os.unlink(tmp.name)
 
-            # ── 生肖分析 ──
+            # 生肖分析（逻辑不变）
             for item in lines_data:
                 item["text"] = _correct_zodiac_text(item["text"])
             summary = build_zodiac_summary(lines_data)
@@ -350,23 +376,18 @@ def do_ocr():
                 "summary": summary,
             })
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             return jsonify({"error": str(e)}), 500
 
 
 @app.route("/ocr/extract", methods=["POST"])
 def do_ocr_extract():
-    """精简模式：仅返回生肖摘要 + 全文"""
-    global ocr
+    global pipeline
     with ocr_lock:
         try:
-            if ocr is None:
-                ocr = PaddleOCR(
-                    lang="ch",
-                    use_angle_cls=True,
-                    det_db_thresh=0.2,
-                    det_db_box_thresh=0.5,
-                    det_db_unclip_ratio=1.8,
-                )
+            if pipeline is None:
+                pipeline = create_pipeline(pipeline="OCR")
 
             file = request.files.get("image")
             if not file:
@@ -382,28 +403,9 @@ def do_ocr_extract():
                 os.unlink(tmp.name)
                 return jsonify({"error": "invalid image"}), 400
 
-            result = ocr.ocr(tmp.name)
             lines_data = []
-            if result and result[0]:
-                for item in result[0]:
-                    if item and len(item) >= 2:
-                        bbox = item[0]
-                        text, conf = item[1][0], item[1][1]
-                        if conf > 0.5:
-                            xs = [p[0] for p in bbox]
-                            ys = [p[1] for p in bbox]
-                            lines_data.append({
-                                "text": text,
-                                "confidence": round(conf, 2),
-                                "x": round(min(xs)),
-                                "y": round(min(ys)),
-                                "w": round(max(xs) - min(xs)),
-                                "h": round(max(ys) - min(ys)),
-                                "cx": round(sum(xs) / 4, 1),
-                                "cy": round(sum(ys) / 4, 1),
-                            })
-
-            lines_data = merge_adjacent(lines_data, tmp.name)
+            for result in pipeline.predict(tmp.name):
+                lines_data = _paddlex_to_lines(result)
             os.unlink(tmp.name)
 
             for item in lines_data:
@@ -417,6 +419,8 @@ def do_ocr_extract():
                 "summary": summary,
             })
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             return jsonify({"error": str(e)}), 500
 
 
